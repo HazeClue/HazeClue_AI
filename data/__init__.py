@@ -1,0 +1,1 @@
+# HazeClue AI — Data Module
