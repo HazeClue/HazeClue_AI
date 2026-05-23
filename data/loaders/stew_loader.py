@@ -97,8 +97,13 @@ def load_stew_dataset(
     
     for lo_file in lo_files:
         # Extract subject ID from filename
-        stem = lo_file.stem  # e.g., "s01_lo" or "1_lo"
-        subject_str = stem.replace("_lo", "").replace("s", "").replace("S", "")
+        stem = lo_file.stem  # e.g., "sub01_lo" or "1_lo"
+        subject_str = stem.replace("_lo", "")
+        # Strip common prefixes: "sub01" → "01", "s01" → "01"
+        for prefix in ["sub", "SUB", "Sub", "s", "S"]:
+            if subject_str.lower().startswith(prefix.lower()):
+                subject_str = subject_str[len(prefix):]
+                break
         try:
             subject_id = int(subject_str)
         except ValueError:
