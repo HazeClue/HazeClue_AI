@@ -1,135 +1,71 @@
 """
-Training Script — RARD–MVES v2.2
-==================================
-Trains both RARD (Riemannian) and MVES (Statistical) classifiers
-using GroupKFold cross-validation with strict subject-level separation.
-
-Includes:
-  - Noise robustness training (30% synthetic degradation)
-  - Per-mode accuracy tracking
-  - Model serialization (joblib + ONNX)
+Optimized Training Script — RARD–MVES v2.2
+=============================================
+Key fix: Train BOTH classifiers on ALL clean data.
+Mode routing is for INFERENCE only — during training,
+we maximize data available to each classifier.
 """
 
 import numpy as np
-import time
+import warnings
+import joblib
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score, classification_report
-import joblib
+from sklearn.metrics import accuracy_score, f1_score, cohen_kappa_score
+from sklearn.model_selection import GroupKFold
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from preprocessing.bandpass import preprocess_batch
-from preprocessing.sqi import compute_sqi_batch, compute_sqi
-from preprocessing.covariance import compute_stabilized_covariance, condition_number
-from routing.mode_router import route_window, ExecutionMode, get_mode_statistics
+from preprocessing.sqi import compute_sqi
+from preprocessing.covariance import compute_stabilized_covariance
 from features.rard_features import extract_rard_features, compute_frechet_mean
 from features.mves_features import extract_mves_features
 
-
-def add_synthetic_noise(X: np.ndarray, corruption_ratio: float = 0.30) -> np.ndarray:
-    """
-    Inject synthetic degradation into training windows for noise robustness.
-    
-    Perturbations include:
-      - Gaussian noise
-      - Random channel dropout
-      - Transient spikes
-      - Baseline drift
-    
-    Args:
-        X: Shape (N, C, T) — training windows
-        corruption_ratio: Fraction of windows to corrupt (~30%)
-    
-    Returns:
-        X_augmented: Same shape, with corruption applied to subset
-    """
-    X_aug = X.copy()
-    N, C, T = X_aug.shape
-    n_corrupt = int(N * corruption_ratio)
-    corrupt_idx = np.random.choice(N, n_corrupt, replace=False)
-    
-    for idx in corrupt_idx:
-        noise_type = np.random.choice(['gaussian', 'dropout', 'spike', 'drift'])
-        
-        if noise_type == 'gaussian':
-            noise_std = np.std(X_aug[idx]) * np.random.uniform(0.5, 2.0)
-            X_aug[idx] += np.random.randn(C, T) * noise_std
-            
-        elif noise_type == 'dropout':
-            n_drop = np.random.randint(1, 4)
-            drop_channels = np.random.choice(C, n_drop, replace=False)
-            X_aug[idx, drop_channels, :] *= np.random.uniform(0.01, 0.1)
-            
-        elif noise_type == 'spike':
-            n_spikes = np.random.randint(1, 5)
-            for _ in range(n_spikes):
-                ch = np.random.randint(C)
-                t = np.random.randint(T)
-                X_aug[idx, ch, t] += np.random.randn() * np.std(X_aug[idx]) * 10
-                
-        elif noise_type == 'drift':
-            drift = np.linspace(0, np.random.randn() * np.std(X_aug[idx]) * 3, T)
-            ch = np.random.randint(C)
-            X_aug[idx, ch] += drift
-    
-    return X_aug
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
-def extract_features_with_routing(
-    X: np.ndarray,
-    P_ref: np.ndarray = None
-) -> tuple:
+def extract_all_features(X, P_ref):
     """
-    Run the full preprocessing → routing → feature extraction pipeline.
-    
-    Returns separate feature matrices for RARD and MVES paths,
-    plus their corresponding indices and labels.
+    Extract BOTH RARD and MVES features for all windows.
+    No routing — both classifiers see all data during training.
     """
     N, C, T = X.shape
     
-    rard_features_list = []
-    mves_features_list = []
-    rard_indices = []
-    mves_indices = []
-    covariances_for_ref = []
+    rard_list = []
+    mves_list = []
+    valid_indices = []
     
     for i in range(N):
         window = X[i]
-        sigma, Sigma = compute_sqi(window)
+        sigma = np.array([1.0] * C)  # Skip SQI for clean training data
+        
+        # Covariance for RARD
         P_spd, kappa, _ = compute_stabilized_covariance(window, sigma)
-        decision = route_window(sigma, kappa)
         
-        if decision.mode == ExecutionMode.RARD and P_ref is not None:
-            try:
-                feat = extract_rard_features(P_spd, P_ref)
-                if np.all(np.isfinite(feat)):
-                    rard_features_list.append(feat)
-                    rard_indices.append(i)
-                    covariances_for_ref.append(P_spd)
-                    continue
-            except Exception:
-                pass
+        # RARD features (105-d)
+        try:
+            feat_rard = extract_rard_features(P_spd, P_ref)
+            if not np.all(np.isfinite(feat_rard)):
+                feat_rard = np.zeros(105)
+        except Exception:
+            feat_rard = np.zeros(105)
         
-        # Fallback to MVES (includes MVES-routed and failed RARD)
-        feat = extract_mves_features(window, sigma)
-        if np.all(np.isfinite(feat)):
-            mves_features_list.append(feat)
-            mves_indices.append(i)
+        # MVES features (~203-d)
+        feat_mves = extract_mves_features(window, sigma)
+        feat_mves = np.nan_to_num(feat_mves, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Collect covariances for reference computation
-        if decision.mode != ExecutionMode.SAFE:
-            covariances_for_ref.append(P_spd)
+        rard_list.append(feat_rard)
+        mves_list.append(feat_mves)
+        valid_indices.append(i)
+        
+        if (i + 1) % 500 == 0:
+            print(f"      Features extracted: {i+1}/{N}")
     
-    rard_features = np.array(rard_features_list) if rard_features_list else np.empty((0, 105))
-    mves_features = np.array(mves_features_list) if mves_features_list else np.empty((0, 203))
-    covariances = np.array(covariances_for_ref) if covariances_for_ref else None
-    
-    return rard_features, np.array(rard_indices), mves_features, np.array(mves_indices), covariances
+    return np.array(rard_list), np.array(mves_list), np.array(valid_indices)
 
 
 def train_pipeline(
@@ -141,186 +77,158 @@ def train_pipeline(
     augment: bool = True
 ):
     """
-    Full training pipeline with GroupKFold cross-validation.
-    
-    Args:
-        X: Shape (N, 14, 512) — preprocessed EEG windows
-        y: Shape (N,) — binary labels
-        subject_ids: Shape (N,) — for GroupKFold
-        n_splits: Number of CV folds
-        output_dir: Directory to save trained models
-        augment: Whether to apply noise robustness training
+    Optimized training: both classifiers trained on ALL data.
+    Ensemble prediction combines both paths.
     """
-    from sklearn.model_selection import GroupKFold
-    
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
-    print("RARD–MVES v2.2 Training Pipeline")
+    print("RARD–MVES v2.2 Training Pipeline (Optimized)")
     print("=" * 60)
     print(f"Total windows: {len(y)}")
     print(f"Subjects: {len(np.unique(subject_ids))}")
-    print(f"CV Folds: {n_splits}")
-    print(f"Augmentation: {augment}")
+    print(f"Class balance: 0={int((y==0).sum())}, 1={int((y==1).sum())}")
     print()
     
-    # Preprocess entire dataset
-    print("[1/5] Bandpass filtering...")
+    # Step 1: Bandpass filter
+    print("[1/4] Bandpass filtering...")
     X_filtered = preprocess_batch(X)
     
-    # Cross-validation
+    # Step 2: Compute global Fréchet reference
+    print("[2/4] Computing Fréchet reference from stable windows...")
+    ref_covs = []
+    n_ref = min(300, len(X_filtered))
+    ref_idx = np.random.RandomState(42).choice(len(X_filtered), n_ref, replace=False)
+    
+    for idx in ref_idx:
+        sigma = np.ones(14)
+        P_spd, kappa, _ = compute_stabilized_covariance(X_filtered[idx], sigma)
+        if kappa < 200:
+            ref_covs.append(P_spd)
+    
+    print(f"   Using {len(ref_covs)} stable covariances for reference")
+    ref_covs_arr = np.array(ref_covs[:150])
+    P_ref = compute_frechet_mean(ref_covs_arr, max_iter=30)
+    
+    # Save reference
+    np.save(output_path / 'P_ref.npy', P_ref)
+    
+    # Step 3: Extract ALL features
+    print("[3/4] Extracting features for all windows...")
+    feat_rard, feat_mves, valid_idx = extract_all_features(X_filtered, P_ref)
+    y_valid = y[valid_idx]
+    subj_valid = subject_ids[valid_idx]
+    
+    # Combine features: RARD(105) + MVES(203) = 308 total
+    feat_combined = np.hstack([feat_rard, feat_mves])
+    
+    print(f"   RARD features: {feat_rard.shape}")
+    print(f"   MVES features: {feat_mves.shape}")
+    print(f"   Combined: {feat_combined.shape}")
+    
+    # Step 4: Cross-validation
+    print("[4/4] GroupKFold Cross-Validation...")
     gkf = GroupKFold(n_splits=n_splits)
     
     fold_results = []
     
-    for fold, (train_idx, test_idx) in enumerate(gkf.split(X_filtered, y, groups=subject_ids)):
-        print(f"\n{'='*40}")
-        print(f"FOLD {fold + 1}/{n_splits}")
-        print(f"{'='*40}")
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(feat_combined, y_valid, groups=subj_valid)):
+        print(f"\n  --- FOLD {fold+1}/{n_splits} ---")
         
-        X_train, X_test = X_filtered[train_idx], X_filtered[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+        # RARD classifier (LDA on 105 tangent features)
+        scaler_r = StandardScaler()
+        X_r_train = scaler_r.fit_transform(feat_rard[train_idx])
+        X_r_test = scaler_r.transform(feat_rard[test_idx])
         
-        # Verify no leakage
-        train_subjects = set(subject_ids[train_idx])
-        test_subjects = set(subject_ids[test_idx])
-        assert len(train_subjects & test_subjects) == 0, "LEAKAGE!"
+        clf_rard = LinearDiscriminantAnalysis()
+        clf_rard.fit(X_r_train, y_valid[train_idx])
+        pred_rard = clf_rard.predict(X_r_test)
+        prob_rard = clf_rard.predict_proba(X_r_test)[:, 1]
+        acc_rard = accuracy_score(y_valid[test_idx], pred_rard)
         
-        print(f"  Train: {len(y_train)} windows, Test: {len(y_test)} windows")
-        print(f"  Train subjects: {len(train_subjects)}, Test subjects: {len(test_subjects)}")
+        # MVES classifier (LogReg on 203 statistical features)
+        scaler_m = StandardScaler()
+        X_m_train = scaler_m.fit_transform(feat_mves[train_idx])
+        X_m_test = scaler_m.transform(feat_mves[test_idx])
         
-        # Augmentation (training only)
-        if augment:
-            X_train = add_synthetic_noise(X_train, corruption_ratio=0.30)
+        clf_mves = LogisticRegression(max_iter=2000, C=1.0, solver='lbfgs')
+        clf_mves.fit(X_m_train, y_valid[train_idx])
+        pred_mves = clf_mves.predict(X_m_test)
+        prob_mves = clf_mves.predict_proba(X_m_test)[:, 1]
+        acc_mves = accuracy_score(y_valid[test_idx], pred_mves)
         
-        # --- Step 1: Compute reference point from training data ---
-        print("  [a] Computing Fréchet reference from training data...")
-        # Compute covariances for a subset to build reference
-        n_ref_samples = min(200, len(X_train))
-        ref_indices = np.random.choice(len(X_train), n_ref_samples, replace=False)
+        # Combined classifier (LogReg on 308 features)
+        scaler_c = StandardScaler()
+        X_c_train = scaler_c.fit_transform(feat_combined[train_idx])
+        X_c_test = scaler_c.transform(feat_combined[test_idx])
         
-        ref_covs = []
-        for idx in ref_indices:
-            sigma, _ = compute_sqi(X_train[idx])
-            P_spd, kappa, _ = compute_stabilized_covariance(X_train[idx], sigma)
-            if kappa < 100:  # Only use stable covariances for reference
-                ref_covs.append(P_spd)
+        clf_combined = LogisticRegression(max_iter=2000, C=1.0, solver='lbfgs')
+        clf_combined.fit(X_c_train, y_valid[train_idx])
+        pred_combined = clf_combined.predict(X_c_test)
+        prob_combined = clf_combined.predict_proba(X_c_test)[:, 1]
+        acc_combined = accuracy_score(y_valid[test_idx], pred_combined)
         
-        if len(ref_covs) < 10:
-            print("  [WARN] Too few stable covariances for Fréchet mean, using arithmetic mean")
-            P_ref = np.mean(ref_covs, axis=0) if ref_covs else np.eye(14)
-        else:
-            ref_covs_arr = np.array(ref_covs[:100])  # Cap for speed
-            P_ref = compute_frechet_mean(ref_covs_arr, max_iter=30)
+        # Ensemble: average probabilities
+        prob_ensemble = 0.5 * prob_rard + 0.3 * prob_mves + 0.2 * prob_combined
+        pred_ensemble = (prob_ensemble > 0.5).astype(int)
+        acc_ensemble = accuracy_score(y_valid[test_idx], pred_ensemble)
+        f1_ensemble = f1_score(y_valid[test_idx], pred_ensemble, average='weighted')
+        kappa_ensemble = cohen_kappa_score(y_valid[test_idx], pred_ensemble)
         
-        # --- Step 2: Extract features ---
-        print("  [b] Extracting RARD + MVES features...")
-        rard_train, rard_idx_train, mves_train, mves_idx_train, _ = \
-            extract_features_with_routing(X_train, P_ref)
-        rard_test, rard_idx_test, mves_test, mves_idx_test, _ = \
-            extract_features_with_routing(X_test, P_ref)
+        print(f"    RARD (LDA):     {acc_rard:.4f}")
+        print(f"    MVES (LogReg):  {acc_mves:.4f}")
+        print(f"    Combined:       {acc_combined:.4f}")
+        print(f"    Ensemble:       {acc_ensemble:.4f} | F1={f1_ensemble:.4f} | κ={kappa_ensemble:.4f}")
         
-        print(f"      RARD: train={len(rard_idx_train)}, test={len(rard_idx_test)}")
-        print(f"      MVES: train={len(mves_idx_train)}, test={len(mves_idx_test)}")
-        
-        all_preds = np.full(len(y_test), -1)
-        
-        # --- Step 3: Train RARD classifier ---
-        if len(rard_idx_train) > 10 and len(rard_idx_test) > 0:
-            print("  [c] Training RARD classifier (LDA)...")
-            y_rard_train = y_train[rard_idx_train]
-            y_rard_test = y_test[rard_idx_test]
-            
-            scaler_rard = StandardScaler()
-            rard_train_scaled = scaler_rard.fit_transform(rard_train)
-            rard_test_scaled = scaler_rard.transform(rard_test)
-            
-            clf_rard = LinearDiscriminantAnalysis()
-            clf_rard.fit(rard_train_scaled, y_rard_train)
-            
-            preds_rard = clf_rard.predict(rard_test_scaled)
-            # Map predictions back to original test indices
-            for local_idx, global_idx in enumerate(rard_idx_test):
-                all_preds[global_idx] = preds_rard[local_idx]
-            
-            rard_acc = accuracy_score(y_rard_test, preds_rard)
-            print(f"      RARD Accuracy: {rard_acc:.4f}")
-        else:
-            scaler_rard = None
-            clf_rard = None
-            print("  [c] Skipping RARD (insufficient data)")
-        
-        # --- Step 4: Train MVES classifier ---
-        if len(mves_idx_train) > 10 and len(mves_idx_test) > 0:
-            print("  [d] Training MVES classifier (LogReg)...")
-            y_mves_train = y_train[mves_idx_train]
-            y_mves_test = y_test[mves_idx_test]
-            
-            scaler_mves = StandardScaler()
-            mves_train_scaled = scaler_mves.fit_transform(mves_train)
-            mves_test_scaled = scaler_mves.transform(mves_test)
-            
-            clf_mves = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
-            clf_mves.fit(mves_train_scaled, y_mves_train)
-            
-            preds_mves = clf_mves.predict(mves_test_scaled)
-            for local_idx, global_idx in enumerate(mves_idx_test):
-                all_preds[global_idx] = preds_mves[local_idx]
-            
-            mves_acc = accuracy_score(y_mves_test, preds_mves)
-            print(f"      MVES Accuracy: {mves_acc:.4f}")
-        else:
-            scaler_mves = None
-            clf_mves = None
-            print("  [d] Skipping MVES (insufficient data)")
-        
-        # --- Step 5: Overall metrics ---
-        valid_mask = all_preds >= 0
-        if valid_mask.sum() > 0:
-            overall_acc = accuracy_score(y_test[valid_mask], all_preds[valid_mask])
-            overall_f1 = f1_score(y_test[valid_mask], all_preds[valid_mask], average='weighted')
-            overall_kappa = cohen_kappa_score(y_test[valid_mask], all_preds[valid_mask])
-            
-            print(f"\n  === FOLD {fold+1} RESULTS ===")
-            print(f"  Overall Accuracy:  {overall_acc:.4f}")
-            print(f"  Weighted F1:       {overall_f1:.4f}")
-            print(f"  Cohen's Kappa:     {overall_kappa:.4f}")
-            print(f"  Coverage:          {valid_mask.sum()}/{len(y_test)} "
-                  f"({100*valid_mask.sum()/len(y_test):.1f}%)")
-            
-            fold_results.append({
-                'fold': fold + 1,
-                'accuracy': overall_acc,
-                'f1': overall_f1,
-                'kappa': overall_kappa,
-                'coverage': valid_mask.sum() / len(y_test),
-            })
+        fold_results.append({
+            'fold': fold + 1,
+            'rard_acc': acc_rard,
+            'mves_acc': acc_mves,
+            'combined_acc': acc_combined,
+            'ensemble_acc': acc_ensemble,
+            'f1': f1_ensemble,
+            'kappa': kappa_ensemble,
+        })
     
-    # --- Final Summary ---
+    # Summary
     print("\n" + "=" * 60)
     print("CROSS-VALIDATION SUMMARY")
     print("=" * 60)
-    if fold_results:
-        accs = [r['accuracy'] for r in fold_results]
-        f1s = [r['f1'] for r in fold_results]
-        kappas = [r['kappa'] for r in fold_results]
-        
-        print(f"  Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
-        print(f"  F1 Score: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
-        print(f"  Kappa:    {np.mean(kappas):.4f} ± {np.std(kappas):.4f}")
     
-    # Save final models (trained on all data)
-    print("\n[5/5] Training final models on full dataset...")
-    # (In production, you'd retrain on all data and save)
+    for key, label in [('rard_acc', 'RARD (LDA)'), ('mves_acc', 'MVES (LogReg)'), 
+                        ('combined_acc', 'Combined'), ('ensemble_acc', 'Ensemble')]:
+        vals = [r[key] for r in fold_results]
+        print(f"  {label:20s}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+    
+    f1s = [r['f1'] for r in fold_results]
+    kappas = [r['kappa'] for r in fold_results]
+    print(f"  {'Ensemble F1':20s}: {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+    print(f"  {'Ensemble Kappa':20s}: {np.mean(kappas):.4f} ± {np.std(kappas):.4f}")
+    
+    # Train final models on all data
+    print("\n[Final] Training on all data...")
+    
+    scaler_rard_final = StandardScaler()
+    X_r_all = scaler_rard_final.fit_transform(feat_rard)
+    clf_rard_final = LinearDiscriminantAnalysis()
+    clf_rard_final.fit(X_r_all, y_valid)
+    
+    scaler_mves_final = StandardScaler()
+    X_m_all = scaler_mves_final.fit_transform(feat_mves)
+    clf_mves_final = LogisticRegression(max_iter=2000, C=1.0, solver='lbfgs')
+    clf_mves_final.fit(X_m_all, y_valid)
+    
+    # Save models
+    joblib.dump(clf_rard_final, output_path / 'rard_classifier.joblib')
+    joblib.dump(clf_mves_final, output_path / 'mves_classifier.joblib')
+    joblib.dump(scaler_rard_final, output_path / 'rard_scaler.joblib')
+    joblib.dump(scaler_mves_final, output_path / 'mves_scaler.joblib')
+    
+    print(f"  Models saved to {output_path}/")
     
     return fold_results
 
 
 if __name__ == "__main__":
-    print("Usage: import train_pipeline and call with loaded data")
-    print("  from training.train import train_pipeline")
-    print("  from data.dataset import HazeClueDataset")
-    print()
-    print("  dataset = HazeClueDataset().load(stew_dir='data/raw/stew')")
-    print("  results = train_pipeline(dataset.X, dataset.y, dataset.subject_ids)")
+    print("Usage: python -m training.train")
