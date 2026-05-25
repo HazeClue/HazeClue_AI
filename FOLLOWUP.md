@@ -63,6 +63,31 @@ trained_models/
 └── P_ref.npy (Fréchet reference point)
 ```
 
+### 5. تحسين الدقة (Session 2 — 24 مايو)
+
+**التحسينات اللي اتعملت:**
+- ✅ Euclidean Alignment (EA) — تطبيع بيانات كل شخص
+- ✅ Filter Bank CSP — spatial filtering عبر 5 frequency bands
+- ✅ GradientBoosting + SVM + RF ensemble
+- ✅ Feature Selection (SelectKBest, mutual info)
+- ✅ Subject-Adaptive evaluation (calibration simulation)
+
+**النتايج النهائية (STEW Dataset, 48 subject, EA + TSClassifier):**
+
+| التقييم | Accuracy | التفاصيل |
+|---------|----------|----------|
+| **Within-Subject** | **99.6% ± 1.1%** | 🏆 48/48 subjects فوق 90% |
+| **Subject-Adaptive** (30% cal) | **83.5% ± 12.4%** | 🎯 33/48 فوق 80%, 22/48 فوق 90% |
+| **Cross-Subject** | **78.6% ± 4.2%** | ✅ كان 63.5% → +15% مع EA! |
+
+**الملفات الجديدة:**
+```
+preprocessing/alignment.py     — Euclidean Alignment
+features/csp_features.py       — Filter Bank CSP
+models/eegnet.py               — EEGNet + ShallowConvNet (لسه ما اتجربش — محتاج PyTorch)
+training/train_v2.py           — Unified 3-level training pipeline
+```
+
 ---
 
 ## ⚠️ المشاكل اللي واجهتنا
