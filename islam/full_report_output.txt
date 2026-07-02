@@ -1,0 +1,136 @@
+======================================================================
+  HazeClue AI — Complete Report Generator
+======================================================================
+
+  Date: 2026-07-02 20:57:17
+  Model dir: /home/ameen/ameen/projects/grad/hazeclue-ai/trained_models
+  Data dir: /home/ameen/ameen/projects/grad/hazeclue-ai/data/raw/stew/STEW Dataset
+
+======================================================================
+  [1/8] Loading trained models
+======================================================================
+  ✅ rard_classifier.joblib: 5.2 KB
+  ✅ mves_classifier.joblib: 2.4 KB
+  ✅ rard_scaler.joblib: 3.0 KB
+  ✅ mves_scaler.joblib: 5.3 KB
+  ✅ P_ref.npy: 1.7 KB
+
+  Model details:
+    RARD classifier: LinearDiscriminantAnalysis
+    MVES classifier: LogisticRegression
+    RARD n_features: 105
+    MVES n_features: 203
+    P_ref shape: (14, 14)
+    P_ref is SPD: True
+
+======================================================================
+  [2/8] Testing on synthetic data
+======================================================================
+[Engine] Loaded RARD classifier
+[Engine] Loaded MVES classifier
+[Engine] Loaded reference point
+  Running inference on 60 synthetic windows...
+
+  Results on synthetic data:
+    Accuracy:         0.500
+    Balanced Acc:     0.500
+    F1 Score:         0.000
+    Cohen's Kappa:    0.000
+    Mean latency:     2.8 ms
+    P95 latency:      4.0 ms
+
+======================================================================
+  [3/8] Testing on real STEW data
+======================================================================
+  Loading STEW dataset...
+[STEW] Loaded 7104 windows from 48 subjects
+       Class 0 (rest): 3552, Class 1 (workload): 3552
+    Subject 1: 74 rest + 74 focus
+    Subject 2: 74 rest + 74 focus
+    Subject 3: 74 rest + 74 focus
+    Subject 12: 74 rest + 74 focus
+    Subject 24: 74 rest + 74 focus
+    Subject 36: 74 rest + 74 focus
+    Subject 48: 74 rest + 74 focus
+
+  Loaded 48 subjects total
+[Engine] Loaded RARD classifier
+[Engine] Loaded MVES classifier
+[Engine] Loaded reference point
+
+  Results on real STEW data (48 subjects):
+    Mean accuracy:    0.824 ± 0.124
+    Min accuracy:     0.550
+    Max accuracy:     1.000
+    Subjects ≥70%:    42/48
+    Subjects ≥80%:    33/48
+    Subjects ≥90%:    17/48
+
+======================================================================
+  [4/8] Testing noise robustness
+======================================================================
+[Engine] Loaded RARD classifier
+[Engine] Loaded MVES classifier
+[Engine] Loaded reference point
+
+  Noise robustness results:
+    noise_0.0: accept=1.00, focus_rate=0.00
+    noise_0.1: accept=1.00, focus_rate=0.00
+    noise_0.2: accept=1.00, focus_rate=0.00
+    noise_0.5: accept=1.00, focus_rate=0.00
+    noise_1.0: accept=1.00, focus_rate=0.00
+    noise_2.0: accept=1.00, focus_rate=0.00
+
+======================================================================
+  [5/8] Measuring latency
+======================================================================
+[Engine] Loaded RARD classifier
+[Engine] Loaded MVES classifier
+[Engine] Loaded reference point
+
+  Latency over 100 iterations:
+    Mean:    2.33 ms
+    Median:  2.25 ms
+    P95:     3.02 ms
+    P99:     3.45 ms
+    Max:     3.48 ms
+
+    Target: <35.0 ms → ✅ PASS
+[Engine] Loaded RARD classifier
+[Engine] Loaded MVES classifier
+[Engine] Loaded reference point
+
+======================================================================
+  [6/8] Model sizes
+======================================================================
+  rard_scaler.joblib: 3.0 KB
+  rard_classifier.joblib: 5.2 KB
+  mves_scaler.joblib: 5.3 KB
+  P_ref.npy: 1.7 KB
+  mves_classifier.joblib: 2.4 KB
+
+  Total model size: 17.6 KB (0.02 MB)
+
+======================================================================
+  [7/8] Generating plots
+======================================================================
+  ✅ Saved confusion_matrix.png
+  ✅ Saved roc_curve.png
+  ✅ Saved per_subject_accuracy.png
+  ✅ Saved latency_distribution.png
+
+======================================================================
+  [8/8] Generating Markdown report
+======================================================================
+  ✅ Saved full_report.md
+  ✅ Saved plots in plots/
+
+======================================================================
+  ✅ ALL TESTS COMPLETE
+======================================================================
+
+  Report: /home/ameen/ameen/projects/grad/hazeclue-ai/full_report.md
+  Plots:  /home/ameen/ameen/projects/grad/hazeclue-ai/plots/
+
+  Send full_report.md to your colleague for committee submission.
+======================================================================
